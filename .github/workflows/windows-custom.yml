@@ -43,6 +43,56 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  preflight:
+    name: Preflight (patch + pins)
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout source at the requested ref
+      uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      with:
+        ref: ${{ inputs.source_ref }}
+        path: src
+        submodules: recursive
+    - name: Checkout CI helpers
+      uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      with:
+        ref: ${{ github.sha }}
+        path: .ci
+        sparse-checkout: .github/custom
+        sparse-checkout-cone-mode: false
+    - name: Apply patch and check pins
+      shell: bash
+      run: 'set -euo pipefail
+
+        cd src
+
+        python3 ../.ci/.github/custom/apply_custom.py
+
+        rg -n ''RENDEZVOUS_SERVERS: &|RS_PUB_KEY: &'' libs/hbb_common/src/config.rs
+
+        wf=.github/workflows/flutter-build.yml
+
+        vcpkg=$(sed -n ''s/^  VCPKG_COMMIT_ID: "\(.*\)"/\1/p'' "$wf" | head -1)
+
+        flutter=$(sed -n ''s/^  FLUTTER_VERSION: "\(.*\)"/\1/p'' "$wf" | head -1)
+
+        llvm=$(sed -n ''s/^  LLVM_VERSION: "\(.*\)"/\1/p'' "$wf" | head -1)
+
+        echo "pins: vcpkg=$vcpkg flutter=$flutter llvm=$llvm"
+
+        cd ..
+
+        python3 - <<''EOF''
+
+        import json, pathlib, re
+
+        toml = pathlib.Path("src/Cargo.toml").read_text()
+
+        version = re.search(r''^version = "(.*)"'', toml, re.M).group(1)
+
+        print("client version at this ref:", version)
+
+        EOF'
   generate-bridge:
     uses: ./.github/workflows/bridge-custom.yml
     with:
@@ -63,6 +113,7 @@ jobs:
   build-windows:
     name: Windows x64 (custom server)
     needs:
+    - preflight
     - generate-bridge
     - build-RustDeskTempTopMostWindow
     runs-on: ${{ matrix.job.os }}
