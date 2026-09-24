@@ -90,9 +90,16 @@ jobs:
       with:
         submodules: recursive
         ref: ${{ inputs.source_ref }}
+    - name: Checkout CI helpers (from the commit running this workflow)
+      uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      with:
+        ref: ${{ github.sha }}
+        path: .ci
+        sparse-checkout: .github/custom
+        sparse-checkout-cone-mode: false
     - name: Apply custom server patch
       shell: bash
-      run: python3 .github/custom/apply_custom.py
+      run: python3 .ci/.github/custom/apply_custom.py
     - name: Determine client version
       shell: bash
       run: 'set -euo pipefail
