@@ -1,0 +1,132 @@
+name: Publish Windows build to R2
+
+# Takes the RustDesk-win64 artifact from an existing windows-custom run (no rebuild),
+# uploads it to R2 as RustDesk-win64.exe and updates the windows block in manifest.json,
+# leaving the macOS entries untouched.
+
+on:
+  workflow_dispatch:
+    inputs:
+      run-id:
+        description: "Actions run id to publish (blank = latest successful windows-custom run)"
+        default: ""
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: r2-manifest-writers
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: auto
+      R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME || 'rustdesk-dl' }}
+      ENDPOINT_URL: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+      BASE_URL: https://dl.davepinto.dev
+    steps:
+      - name: Resolve run, commit and version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_RUN_ID: ${{ inputs.run-id }}
+        run: |
+          set -euo pipefail
+          run_id="$INPUT_RUN_ID"
+          if [ -z "$run_id" ]; then
+            run_id=$(gh run list -R "$GITHUB_REPOSITORY" --workflow windows-custom.yml \
+              --status success --limit 1 --json databaseId --jq '.[0].databaseId')
+          fi
+          test -n "$run_id"
+          sha=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id" --jq .head_sha)
+          version=$(curl -fsSL "https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$sha/Cargo.toml" \
+            | sed -n 's/^version = "\(.*\)"/\1/p' | head -1)
+          if [ -z "$version" ]; then
+            echo "::error::could not read version from Cargo.toml at $sha"
+            exit 1
+          fi
+          {
+            echo "RUN_ID=$run_id"
+            echo "SOURCE_SHA=$sha"
+            echo "VERSION=$version"
+          } >> "$GITHUB_ENV"
+          echo "Publishing run $run_id (commit $sha, version $version)"
+
+      - name: Download built artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: RustDesk-win64
+          run-id: ${{ env.RUN_ID }}
+          github-token: ${{ github.token }}
+          path: dist
+
+      - name: Checksum
+        run: |
+          set -euo pipefail
+          ls -l dist
+          test -s dist/RustDesk-win64.exe
+          size=$(stat -c%s dist/RustDesk-win64.exe)
+          sha=$(sha256sum dist/RustDesk-win64.exe | cut -d' ' -f1)
+          {
+            echo "SIZE=$size"
+            echo "SHA256=$sha"
+            echo "RELEASED=$(date -u +%F)"
+          } >> "$GITHUB_ENV"
+          echo "RustDesk-win64.exe: $size bytes, sha256 $sha"
+
+      - name: Upload binary to R2
+        run: |
+          set -euo pipefail
+          aws s3 cp dist/RustDesk-win64.exe "s3://$R2_BUCKET_NAME/RustDesk-win64.exe" \
+            --endpoint-url "$ENDPOINT_URL" --only-show-errors \
+            --content-type application/vnd.microsoft.portable-executable \
+            --cache-control "public, max-age=600, must-revalidate"
+
+      - name: Update manifest.json in R2
+        run: |
+          set -euo pipefail
+          if aws s3 cp "s3://$R2_BUCKET_NAME/manifest.json" manifest.json \
+               --endpoint-url "$ENDPOINT_URL" --only-show-errors 2>/dev/null; then
+            echo "existing manifest fetched"
+          else
+            echo "{}" > manifest.json
+          fi
+          python3 - <<'EOF'
+          import json, os, pathlib
+
+          p = pathlib.Path("manifest.json")
+          try:
+              d = json.loads(p.read_text())
+          except Exception:
+              d = {}
+          d["windows"] = {
+              "url": os.environ["BASE_URL"] + "/RustDesk-win64.exe",
+              "size": int(os.environ["SIZE"]),
+              "sha256": os.environ["SHA256"],
+              "version": os.environ["VERSION"],
+              "source_url": "https://github.com/" + os.environ["GITHUB_REPOSITORY"],
+              "source_commit": os.environ["SOURCE_SHA"],
+          }
+          d["released"] = os.environ.get("RELEASED", d.get("released", ""))
+          p.write_text(json.dumps(d, indent=2, sort_keys=False) + "\n")
+          print(p.read_text())
+          EOF
+          aws s3 cp manifest.json "s3://$R2_BUCKET_NAME/manifest.json" \
+            --endpoint-url "$ENDPOINT_URL" --only-show-errors \
+            --content-type application/json \
+            --cache-control "no-cache, no-store, must-revalidate"
+
+      - name: Summary
+        run: |
+          {
+            echo "### Windows client published"
+            echo ""
+            echo "- binary: $BASE_URL/RustDesk-win64.exe ($SIZE bytes)"
+            echo "- sha256: \`$SHA256\`"
+            echo "- version: $VERSION (source commit $SOURCE_SHA)"
+            echo "- manifest: $BASE_URL/manifest.json"
+          } >> "$GITHUB_STEP_SUMMARY"
