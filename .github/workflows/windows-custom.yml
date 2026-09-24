@@ -1,14 +1,17 @@
 name: Build custom Windows client
 
-# Builds the Windows x64 portable client from this fork with the self-hosted server baked
-# in, using upstream's own pipeline minus signing, MSI and release publishing.
+# Builds the Windows x64 PORTABLE client from a chosen upstream ref with the self-hosted
+# server baked in. Portable = single self-extracting exe, no installation, no service.
 #
-# Dispatch from the Actions tab. "publish" uploads to R2 and updates manifest.json
-# (needs the R2_* secrets in this repository).
+#   source_ref: upstream tag or branch to build (default master). Use a release tag
+#               such as 1.4.9 for a stable build.
 
 on:
   workflow_dispatch:
     inputs:
+      source_ref:
+        description: Upstream tag or branch to build (e.g. 1.4.9)
+        default: master
       upload-tag:
         description: Artifact label (cosmetic)
         default: custom
@@ -41,7 +44,9 @@ concurrency:
 
 jobs:
   generate-bridge:
-    uses: ./.github/workflows/bridge.yml
+    uses: ./.github/workflows/bridge-custom.yml
+    with:
+      source_ref: ${{ inputs.source_ref }}
   build-RustDeskTempTopMostWindow:
     uses: ./.github/workflows/third-party-RustDeskTempTopMostWindow.yml
     strategy:
@@ -84,6 +89,7 @@ jobs:
       uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
       with:
         submodules: recursive
+        ref: ${{ inputs.source_ref }}
     - name: Apply custom server patch
       shell: bash
       run: python3 .github/custom/apply_custom.py
@@ -98,6 +104,30 @@ jobs:
         echo "VERSION=$version" >> "$GITHUB_ENV"
 
         echo "Building RustDesk $version from $GITHUB_SHA"'
+    - name: Derive tool pins from source
+      id: pins
+      shell: bash
+      run: 'set -euo pipefail
+
+        wf=.github/workflows/flutter-build.yml
+
+        test -f "$wf" || { echo "::error::$wf missing at this ref"; exit 1; }
+
+        vcpkg=$(sed -n ''s/^  VCPKG_COMMIT_ID: "\(.*\)"/\1/p'' "$wf" | head -1)
+
+        flutter=$(sed -n ''s/^  FLUTTER_VERSION: "\(.*\)"/\1/p'' "$wf" | head -1)
+
+        llvm=$(sed -n ''s/^  LLVM_VERSION: "\(.*\)"/\1/p'' "$wf" | head -1)
+
+        test -n "$vcpkg" || { echo "::error::no VCPKG_COMMIT_ID found in $wf"; exit 1; }
+
+        test "$flutter" = "$FLUTTER_VERSION" || { echo "::error::source expects Flutter $flutter but workflow uses $FLUTTER_VERSION"; exit 1; }
+
+        test "$llvm" = "$LLVM_VERSION" || { echo "::error::source expects LLVM $llvm but workflow uses $LLVM_VERSION"; exit 1; }
+
+        echo "commit=$vcpkg" >> "$GITHUB_OUTPUT"
+
+        echo "pins for this ref: vcpkg=$vcpkg flutter=$flutter llvm=$llvm"'
     - name: Restore bridge files
       uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
       with:
@@ -151,7 +181,7 @@ jobs:
       uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2
       with:
         vcpkgDirectory: C:\vcpkg
-        vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+        vcpkgGitCommitId: ${{ steps.pins.outputs.commit }}
         doNotCache: false
     - name: Install vcpkg dependencies
       env:
