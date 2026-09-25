@@ -1,8 +1,17 @@
 name: Publish Windows build to R2
 
-# Takes the RustDesk-win64 artifact from an existing windows-custom run (no rebuild),
-# uploads it to R2 as RustDesk-win64.exe and updates the windows block in manifest.json,
-# leaving the macOS entries untouched.
+# Takes the RustDesk-win64 artifact from a windows-custom run (no rebuild), uploads it to R2 as
+# RustDesk-win64.exe and updates the windows block in manifest.json, leaving the macOS entries
+# untouched. Called by windows-custom.yml when its `publish` input is set, or run by hand to
+# publish (or roll back to) an earlier build.
+#
+# Version and source links come from the build-info.json inside the artifact, so they always
+# describe the code that was actually built. Runs from before build-info.json existed cannot be
+# published.
+#
+# manifest.json is also written by rustdesk-portal's mirror-macos.yml, in another repository, so a
+# concurrency group cannot serialise the two. The manifest is written with a conditional PUT
+# (If-Match on the ETag that was read) and retried if the other writer got there first.
 
 on:
   workflow_dispatch:
@@ -10,18 +19,23 @@ on:
       run-id:
         description: "Actions run id to publish (blank = latest successful windows-custom run)"
         default: ""
+  workflow_call:
+    inputs:
+      run-id:
+        description: Actions run id whose RustDesk-win64 artifact to publish
+        type: string
+        required: true
 
 permissions:
   contents: read
   actions: read
 
-concurrency:
-  group: r2-manifest-writers
-  cancel-in-progress: false
-
 jobs:
   publish:
     runs-on: ubuntu-latest
+    concurrency:
+      group: r2-manifest-writers
+      cancel-in-progress: false
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
@@ -30,7 +44,7 @@ jobs:
       ENDPOINT_URL: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
       BASE_URL: https://dl.davepinto.dev
     steps:
-      - name: Resolve run, commit and version
+      - name: Resolve run
         env:
           GH_TOKEN: ${{ github.token }}
           INPUT_RUN_ID: ${{ inputs.run-id }}
@@ -41,42 +55,41 @@ jobs:
             run_id=$(gh run list -R "$GITHUB_REPOSITORY" --workflow windows-custom.yml \
               --status success --limit 1 --json databaseId --jq '.[0].databaseId')
           fi
-          test -n "$run_id"
-          sha=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id" --jq .head_sha)
-          version=$(curl -fsSL "https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$sha/Cargo.toml" \
-            | sed -n 's/^version = "\(.*\)"/\1/p' | head -1)
-          if [ -z "$version" ]; then
-            echo "::error::could not read version from Cargo.toml at $sha"
-            exit 1
-          fi
-          {
-            echo "RUN_ID=$run_id"
-            echo "SOURCE_SHA=$sha"
-            echo "VERSION=$version"
-          } >> "$GITHUB_ENV"
-          echo "Publishing run $run_id (commit $sha, version $version)"
+          test -n "$run_id" || { echo "::error::no successful windows-custom run found"; exit 1; }
+          echo "RUN_ID=$run_id" >> "$GITHUB_ENV"
+          echo "Publishing run $run_id"
 
       - name: Download built artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: RustDesk-win64
+          # Without a token the action reads the current run, which is what a call from
+          # windows-custom wants; a token switches it to the API lookup for another run.
           run-id: ${{ env.RUN_ID }}
-          github-token: ${{ github.token }}
+          github-token: ${{ env.RUN_ID != github.run_id && github.token || '' }}
           path: dist
 
-      - name: Checksum
+      - name: Read build info and checksum
         run: |
           set -euo pipefail
           ls -l dist
           test -s dist/RustDesk-win64.exe
+          if [ ! -s dist/build-info.json ]; then
+            echo "::error::run $RUN_ID has no build-info.json (built before it was added); rebuild instead"
+            exit 1
+          fi
+          cat dist/build-info.json
+          version=$(jq -r '.version // empty' dist/build-info.json)
+          test -n "$version" || { echo "::error::build-info.json has no version"; exit 1; }
           size=$(stat -c%s dist/RustDesk-win64.exe)
           sha=$(sha256sum dist/RustDesk-win64.exe | cut -d' ' -f1)
           {
+            echo "VERSION=$version"
             echo "SIZE=$size"
             echo "SHA256=$sha"
             echo "RELEASED=$(date -u +%F)"
           } >> "$GITHUB_ENV"
-          echo "RustDesk-win64.exe: $size bytes, sha256 $sha"
+          echo "RustDesk-win64.exe $version: $size bytes, sha256 $sha"
 
       - name: Upload binary to R2
         run: |
@@ -89,36 +102,60 @@ jobs:
       - name: Update manifest.json in R2
         run: |
           set -euo pipefail
-          if aws s3 cp "s3://$R2_BUCKET_NAME/manifest.json" manifest.json \
-               --endpoint-url "$ENDPOINT_URL" --only-show-errors 2>/dev/null; then
-            echo "existing manifest fetched"
-          else
-            echo "{}" > manifest.json
-          fi
-          python3 - <<'EOF'
-          import json, os, pathlib
+          for attempt in 1 2 3 4 5; do
+            rm -f manifest.json
+            if aws s3api get-object --bucket "$R2_BUCKET_NAME" --key manifest.json \
+                 --endpoint-url "$ENDPOINT_URL" manifest.json > head.json 2>/dev/null; then
+              etag=$(jq -r '.ETag' head.json)
+              condition=(--if-match "$etag")
+              echo "fetched manifest (etag $etag)"
+            else
+              echo '{"version":"","released":"","windows":{},"mac_arm64":{},"mac_intel":{}}' > manifest.json
+              condition=(--if-none-match '*')
+              echo "no manifest yet, creating one"
+            fi
 
-          p = pathlib.Path("manifest.json")
-          try:
-              d = json.loads(p.read_text())
-          except Exception:
-              d = {}
-          d["windows"] = {
-              "url": os.environ["BASE_URL"] + "/RustDesk-win64.exe",
-              "size": int(os.environ["SIZE"]),
-              "sha256": os.environ["SHA256"],
-              "version": os.environ["VERSION"],
-              "source_url": "https://github.com/" + os.environ["GITHUB_REPOSITORY"],
-              "source_commit": os.environ["SOURCE_SHA"],
-          }
-          d["released"] = os.environ.get("RELEASED", d.get("released", ""))
-          p.write_text(json.dumps(d, indent=2, sort_keys=False) + "\n")
-          print(p.read_text())
-          EOF
-          aws s3 cp manifest.json "s3://$R2_BUCKET_NAME/manifest.json" \
-            --endpoint-url "$ENDPOINT_URL" --only-show-errors \
-            --content-type application/json \
-            --cache-control "no-cache, no-store, must-revalidate"
+            jq \
+              --arg url "$BASE_URL/RustDesk-win64.exe" \
+              --argjson size "$SIZE" \
+              --arg sha "$SHA256" \
+              --arg released "$RELEASED" \
+              --slurpfile info dist/build-info.json \
+              '
+              ($info[0]) as $b
+              | .released = $released
+              | .windows = {
+                  url: $url,
+                  size: $size,
+                  sha256: $sha,
+                  version: $b.version,
+                  upstream_tag: $b.upstream_ref,
+                  upstream_commit: $b.upstream_commit,
+                  source_url: ("https://github.com/" + $b.upstream_repo + "/tree/" + $b.upstream_commit),
+                  patch_url: ("https://github.com/" + $b.fork_repo + "/tree/" + $b.fork_commit + "/.github/custom"),
+                  build_url: $b.run_url
+                }
+              ' manifest.json > manifest.new
+            cat manifest.new
+
+            if err=$(aws s3api put-object --bucket "$R2_BUCKET_NAME" --key manifest.json \
+                  --endpoint-url "$ENDPOINT_URL" --body manifest.new \
+                  --content-type application/json \
+                  --cache-control "no-cache, no-store, must-revalidate" \
+                  "${condition[@]}" 2>&1 >/dev/null); then
+              echo "manifest.json updated"
+              exit 0
+            fi
+            if grep -qE 'PreconditionFailed|412' <<<"$err"; then
+              echo "manifest.json changed while updating it (attempt $attempt); retrying"
+              sleep $((attempt * 3))
+              continue
+            fi
+            echo "::error::manifest upload failed: $err"
+            exit 1
+          done
+          echo "::error::gave up updating manifest.json after 5 conflicting attempts"
+          exit 1
 
       - name: Summary
         run: |
@@ -127,6 +164,6 @@ jobs:
             echo ""
             echo "- binary: $BASE_URL/RustDesk-win64.exe ($SIZE bytes)"
             echo "- sha256: \`$SHA256\`"
-            echo "- version: $VERSION (source commit $SOURCE_SHA)"
+            echo "- version: $VERSION (from run $RUN_ID)"
             echo "- manifest: $BASE_URL/manifest.json"
           } >> "$GITHUB_STEP_SUMMARY"
